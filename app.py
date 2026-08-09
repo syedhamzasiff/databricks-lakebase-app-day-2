@@ -7,6 +7,16 @@ Databricks App boilerplate:
 Run locally:
     python app.py
 Deploy as a Databricks App using app.yaml.
+
+--------------------------------------------------------------------------
+WEATHER HOMEWORK ADDITIONS (search for "# [WEATHER]" to see everything added):
+  - import WeatherClient
+  - weather config constants + lazy embedding-model loader
+  - ensure_weather_documents_table()
+  - POST /weather/sync  + _upsert_weather_batch()
+  - POST /weather/search
+Everything else is unchanged from the reference app.
+--------------------------------------------------------------------------
 """
 
 import logging
@@ -19,6 +29,7 @@ from flask import Flask, jsonify, render_template, request
 
 import lakebase
 from massive_client import MassiveClient
+from weather_client import WeatherClient  # [WEATHER]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("massive-app")
@@ -30,6 +41,13 @@ TABLE_NAME = os.environ.get("MASSIVE_TABLE_NAME", "massive_records")
 WATCHLIST_TABLE_NAME = os.environ.get("WATCHLIST_TABLE_NAME", "watchlist")
 NEWS_TABLE_NAME = os.environ.get("NEWS_TABLE_NAME", "ticker_news_documents")
 
+# [WEATHER] weather config
+WEATHER_DOCS_TABLE = os.environ.get("WEATHER_DOCS_TABLE", "weather_documents")
+WEATHER_EMB_TABLE = os.environ.get("WEATHER_EMB_TABLE", "weather_embeddings")
+WEATHER_EMBED_MODEL = os.environ.get(
+    "WEATHER_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
+)
+
 # Tickers to fetch news for by default (comma-separated), e.g. "AAPL,MSFT,GOOGL"
 DEFAULT_NEWS_TICKERS = [
     t.strip().upper()
@@ -38,9 +56,27 @@ DEFAULT_NEWS_TICKERS = [
 ]
 
 # Basic stock ticker shape check: 1-10 uppercase letters, with an optional
-# ".X" or ".XX" share-class suffix (e.g. "BRK.B"). This rejects obviously
-# malformed input before we even call the Massive API.
+# ".X" or ".XX" share-class suffix (e.g. "BRK.B").
 _TICKER_RE = re.compile(r"^[A-Z]{1,10}(\.[A-Z]{1,2})?$")
+
+
+# [WEATHER] Lazily load the sentence-transformers model ONCE (not per request).
+# Loaded on first /weather/search call so app startup/import stays fast.
+_search_model = None
+
+
+def _get_search_model():
+    global _search_model
+    if _search_model is None:
+        from sentence_transformers import SentenceTransformer  # imported lazily
+        logger.info("Loading embedding model %s ...", WEATHER_EMBED_MODEL)
+        _search_model = SentenceTransformer(WEATHER_EMBED_MODEL)
+    return _search_model
+
+
+def _to_vector_literal(vec) -> str:
+    """pgvector text format '[0.1,0.2,...]' - pass with a %s::vector cast."""
+    return "[" + ",".join(f"{float(x):.6f}" for x in vec) + "]"
 
 
 def ensure_table():
@@ -72,12 +108,7 @@ def ensure_watchlist_table():
 
 
 def ensure_news_table():
-    """
-    Create the raw ticker-news documents table in Lakebase if it doesn't
-    exist yet. This is the RAW document store the Spark notebook
-    (notebooks/ingest_ticker_news_embeddings.py) reads from to compute
-    vector embeddings into a separate `<NEWS_TABLE_NAME>_embeddings` table.
-    """
+    """Create the raw ticker-news documents table in Lakebase if needed."""
     lakebase.run_write(
         f"""
         CREATE TABLE IF NOT EXISTS {NEWS_TABLE_NAME} (
@@ -103,14 +134,35 @@ def ensure_news_table():
     )
 
 
-def _current_user_email() -> str:
-    """
-    Resolve the current user's email so the watchlist can be personalized.
+def ensure_weather_documents_table():  # [WEATHER]
+    """Create the raw weather documents table if it doesn't exist yet.
 
-    Databricks Apps inject the logged-in user's identity via the
-    X-Forwarded-Email header on every request. Fall back to the Databricks
-    SDK's current_user API for local development where that header isn't set.
+    Mirrors ensure_news_table(). Note: the weather_embeddings vector table is
+    created via sql/06_setup_weather_embeddings.sql (it needs CREATE EXTENSION
+    vector), same manual-SQL pattern the course uses for the news vectors.
     """
+    lakebase.run_write(
+        f"""
+        CREATE TABLE IF NOT EXISTS {WEATHER_DOCS_TABLE} (
+            id             TEXT PRIMARY KEY,
+            location       TEXT NOT NULL,
+            source_type    TEXT NOT NULL,
+            headline       TEXT,
+            narrative_text TEXT NOT NULL,
+            issued_at      TIMESTAMPTZ,
+            payload        JSONB NOT NULL,
+            synced_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
+    lakebase.run_write(
+        f"CREATE INDEX IF NOT EXISTS idx_{WEATHER_DOCS_TABLE}_location "
+        f"ON {WEATHER_DOCS_TABLE} (location)"
+    )
+
+
+def _current_user_email() -> str:
+    """Resolve the current user's email (Databricks Apps inject X-Forwarded-Email)."""
     header_email = request.headers.get("X-Forwarded-Email")
     if header_email:
         return header_email
@@ -124,8 +176,7 @@ def healthz():
 
 @app.errorhandler(Exception)
 def handle_exception(err):
-    """Ensure all unhandled errors return JSON (not an HTML error page),
-    so the frontend's resp.json() call never chokes on HTML."""
+    """Ensure all unhandled errors return JSON (not an HTML error page)."""
     logger.exception("Unhandled exception while processing request")
     status_code = getattr(err, "code", 500)
     if not isinstance(status_code, int):
@@ -152,10 +203,7 @@ def list_records():
 
 @app.route("/sync", methods=["POST"])
 def sync_from_massive():
-    """
-    Pull data from the Massive API (paginated, potentially huge dataset) and
-    upsert it into Lakebase in batches.
-    """
+    """Pull data from the Massive API (paginated) and upsert into Lakebase."""
     ensure_table()
     client = MassiveClient()
 
@@ -178,14 +226,7 @@ def sync_from_massive():
 
 @app.route("/news/sync", methods=["POST"])
 def sync_news_from_massive():
-    """
-    Pull recent news articles for a set of tickers from Massive (ONE API
-    call per ticker, via MassiveClient.get_news) and upsert them into the
-    ticker_news_documents table in Lakebase.
-
-    Body (optional JSON): {"tickers": ["AAPL", "MSFT"], "limit": 50}
-    Defaults to DEFAULT_NEWS_TICKERS when no tickers are supplied.
-    """
+    """Pull recent news for a set of tickers and upsert into ticker_news_documents."""
     ensure_news_table()
     client = MassiveClient()
 
@@ -204,6 +245,68 @@ def sync_news_from_massive():
     return jsonify({"synced": total, "tickers": tickers})
 
 
+# ==========================================================================
+# [WEATHER] Weather sync + semantic search
+# ==========================================================================
+
+
+@app.route("/weather/sync", methods=["POST"])
+def sync_weather():
+    """Harvest NWS alerts + forecasts for locations and upsert into weather_documents.
+
+    Body (JSON): {"locations": ["Chicago, IL", "Austin, TX"], "limit": 50}
+    """
+    ensure_weather_documents_table()
+
+    body = request.json if request.is_json else {}
+    locations = body.get("locations") or []
+    locations = [loc.strip() for loc in locations if isinstance(loc, str) and loc.strip()]
+    if not locations:
+        return jsonify({"error": "locations is required (list of 'City, ST' or 'lat,lon')"}), 400
+    limit = int(body.get("limit", 50))
+
+    client = WeatherClient()
+    docs = client.harvest(locations, limit=limit)
+    synced = _upsert_weather_batch(docs)
+
+    return jsonify({"synced": synced, "locations": locations})
+
+
+@app.route("/weather/search", methods=["POST"])
+def search_weather():
+    """Semantic search over weather_embeddings using pgvector cosine distance.
+
+    Body (JSON): {"query": "flash flood risk this weekend", "top_k": 5}
+    """
+    body = request.json if request.is_json else {}
+    query = (body.get("query") or "").strip()
+    if not query:
+        return jsonify({"error": "query is required"}), 400
+
+    try:
+        top_k = int(body.get("top_k", 5))
+    except (TypeError, ValueError):
+        top_k = 5
+    top_k = max(1, min(20, top_k))  # clamp to 1..20
+
+    model = _get_search_model()
+    query_literal = _to_vector_literal(model.encode(query).tolist())
+
+    rows = lakebase.run_query(
+        f"""
+        SELECT d.id, d.location, d.headline, d.narrative_text, e.chunk_text,
+               1 - (e.embedding <=> %s::vector) AS similarity
+        FROM {WEATHER_EMB_TABLE} e
+        JOIN {WEATHER_DOCS_TABLE} d ON d.id = e.document_id
+        ORDER BY e.embedding <=> %s::vector
+        LIMIT %s
+        """,
+        (query_literal, query_literal, top_k),
+    )
+    # Empty weather_embeddings (nothing synced/embedded yet) -> rows == [] -> results: []
+    return jsonify({"query": query, "top_k": top_k, "results": rows})
+
+
 @app.route("/watchlist", methods=["GET"])
 def get_watchlist():
     """Return the current user's watchlist symbols, with their last known price."""
@@ -219,11 +322,7 @@ def get_watchlist():
 
 @app.route("/watchlist", methods=["POST"])
 def add_to_watchlist():
-    """
-    Fetch the latest price for a single stock symbol from Massive using
-    exactly ONE API call (see MassiveClient.get_latest_price), then add/
-    update that symbol on the watchlist in Lakebase.
-    """
+    """Fetch latest price for a symbol (ONE Massive call) and add to the watchlist."""
     ensure_watchlist_table()
 
     if request.is_json:
@@ -238,15 +337,12 @@ def add_to_watchlist():
 
     client = MassiveClient()
     try:
-        data = client.get_latest_price(symbol)  # <-- single API call, latest price only
+        data = client.get_latest_price(symbol)
     except requests.HTTPError:
-        # Massive returns a 404/4xx for tickers it doesn't recognize.
         return jsonify({"error": f"Unknown ticker symbol: {symbol}"}), 400
 
     price = _extract_latest_price(data)
     if price is None:
-        # No usable price in the response (e.g. delisted/invalid ticker
-        # that still 200s with an empty result set) - don't add it.
         return jsonify({"error": f"No price data available for ticker: {symbol}"}), 400
 
     email = _current_user_email()
@@ -287,20 +383,7 @@ def delete_from_watchlist(symbol: str):
 
 
 def _extract_latest_price(data: dict) -> float | None:
-    """Pull the trade price out of the Massive 'previous close' response shape.
-
-    The /v2/aggs/ticker/{symbol}/prev endpoint returns "results" as a LIST
-    containing a single aggregate bar (not a dict), e.g.:
-        {"status": "OK", "resultsCount": 1, "results": [{"c": 148.845, ...}]}
-    Previously this code treated "results" as a dict, so isinstance(results, dict)
-    was always False for this endpoint's real shape and the price silently
-    resolved to None. Unwrap the list here, and check "status"/"resultsCount"
-    so invalid tickers (empty results) are detected instead of "succeeding"
-    with a null price.
-
-    Adjust the key lookup here if the real Massive API returns a different
-    field name for the traded/close price.
-    """
+    """Pull the trade price out of the Massive 'previous close' response shape."""
     if not isinstance(data, dict):
         return None
     if data.get("status") not in (None, "OK") or data.get("resultsCount") == 0:
@@ -316,11 +399,7 @@ def _extract_latest_price(data: dict) -> float | None:
 
 
 def _upsert_batch(items: list[dict]) -> int:
-    """Upsert a batch of Massive API items into Lakebase, one statement per row.
-
-    For very large batches, consider psycopg2.extras.execute_values for
-    higher throughput instead of per-row execute calls.
-    """
+    """Upsert a batch of Massive API items into Lakebase, one statement per row."""
     import json as _json
 
     count = 0
@@ -343,12 +422,7 @@ def _upsert_batch(items: list[dict]) -> int:
 
 
 def _upsert_news_batch(ticker: str, articles: list[dict]) -> int:
-    """Upsert news articles for a single ticker into the news documents table.
-
-    Flattens the top-level "insights" sentiment entry that matches this
-    ticker (if present) into its own columns so the Spark notebook can read
-    plain text columns instead of parsing JSONB for the common case.
-    """
+    """Upsert news articles for a single ticker into the news documents table."""
     import json as _json
 
     count = 0
@@ -399,6 +473,52 @@ def _upsert_news_batch(ticker: str, articles: list[dict]) -> int:
                         sentiment_reasoning,
                         article.get("published_utc"),
                         _json.dumps(article),
+                    ),
+                )
+                count += 1
+            conn.commit()
+    return count
+
+
+def _upsert_weather_batch(docs: list[dict]) -> int:  # [WEATHER]
+    """Upsert normalized weather documents into weather_documents.
+
+    Follows the same get_connection() + manual commit pattern as
+    _upsert_news_batch above.
+    """
+    import json as _json
+
+    if not docs:
+        return 0
+
+    count = 0
+    with lakebase.get_connection() as conn:
+        with conn.cursor() as cur:
+            for d in docs:
+                cur.execute(
+                    f"""
+                    INSERT INTO {WEATHER_DOCS_TABLE} (
+                        id, location, source_type, headline, narrative_text,
+                        issued_at, payload, synced_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+                    ON CONFLICT (id) DO UPDATE
+                        SET location       = EXCLUDED.location,
+                            source_type    = EXCLUDED.source_type,
+                            headline       = EXCLUDED.headline,
+                            narrative_text = EXCLUDED.narrative_text,
+                            issued_at      = EXCLUDED.issued_at,
+                            payload        = EXCLUDED.payload,
+                            synced_at      = EXCLUDED.synced_at
+                    """,
+                    (
+                        d["id"],
+                        d["location"],
+                        d["source_type"],
+                        d.get("headline"),
+                        d["narrative_text"],
+                        d.get("issued_at"),
+                        _json.dumps(d.get("payload", {})),
                     ),
                 )
                 count += 1

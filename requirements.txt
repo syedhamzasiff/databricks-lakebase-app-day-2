@@ -5,3 +5,7 @@ sqlalchemy>=2.0.30
 flask>=3.0.3
 requests>=2.32.3
 python-dotenv>=1.0.1
+# [WEATHER] needed by POST /weather/search to embed the query in-app.
+# This pulls in torch and is a heavy dependency; see README_WEATHER.md
+# "Limitations" for the lighter model-serving alternative.
+sentence-transformers>=2.7.0

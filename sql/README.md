@@ -42,15 +42,19 @@ UNION ALL
 SELECT 'ticker_news_chunk_embeddings', COUNT(*), COUNT(embedding) FROM ticker_news_chunk_embeddings;
 ```
 
-## Why Manual Setup?
+## Write Paths by Pipeline
 
-The notebook uses **Spark JDBC only** (no psycopg2) to avoid kernel crashes on Serverless compute. Spark JDBC has limitations:
+**Ticker News Pipeline (`ingest_ticker_news_embeddings`)**: Uses **Spark JDBC only** (no psycopg2) to avoid kernel crashes on Serverless compute. Spark JDBC has limitations:
 * Cannot execute arbitrary DDL (CREATE EXTENSION, CREATE INDEX)
 * Cannot write to pgvector's VECTOR type directly
 * Cannot use ON CONFLICT for upserts
 
+**Weather Pipeline (`ingest_weather_embeddings`)**: Uses **psycopg2 with `execute_values`** for direct vector writes. Embeddings are written as pgvector text literals `'[...]'::vector` with `ON CONFLICT (document_id, chunk_index)` for idempotent upserts. **`spark.write.jdbc` is NOT used** for the weather pipeline.
+
+## Why Manual Setup?
+
 By running setup SQL manually, you get:
 * ✅ Proper pgvector VECTOR columns
 * ✅ HNSW indexes for fast similarity search  
-* ✅ Stable notebook execution (no psycopg2 crashes)
-* ✅ Idempotent writes (deduplication via left anti-join)
+* ✅ Stable notebook execution
+* ✅ Idempotent writes (weather: ON CONFLICT; ticker: left anti-join)

@@ -21,7 +21,7 @@ _DEFAULT_TIMEOUT = 30
 
 # NWS BLOCKS requests without a descriptive User-Agent that includes a contact.
 # Put YOUR real email here before running.
-_USER_AGENT = "(databricks-weather-homework, your-email@example.com)"
+_USER_AGENT = "(databricks-weather-homework, syedhamzasiff@gmail.com)"
 
 # NWS works off lat/lon, not city names. For a homework-sized set a small map
 # is enough. (For arbitrary cities, resolve via the free US Census geocoder -

@@ -1,148 +1,115 @@
 """
-Client for the National Weather Service API (api.weather.gov).
+Client for the Massive API.
 
-Mirrors the shape of massive_client.py, but the NWS API needs NO API key and
-NO secret scope - it only requires a descriptive User-Agent header. So this
-client is simpler: no Databricks SDK, no auth plumbing.
-
-It resolves each location to an NWS grid point, then fetches:
-  - active weather alerts (rich free-text: description + instruction)
-  - the multi-day forecast (narrative detailedForecast per period)
-and normalizes both into a common `weather_documents` record shape.
+The API key is stored in a Databricks secret scope (see setup_secrets.py) and
+resolved at runtime via the Databricks SDK - it is never stored in code, env
+files, or app.yaml.
 """
 
-import hashlib
-from datetime import datetime, timezone
+import base64
+import os
 from typing import Any
 
 import requests
+from databricks.sdk import WorkspaceClient
+
+_w = WorkspaceClient()
+
+_SCOPE = os.environ.get("MASSIVE_SECRET_SCOPE", "massive")
+_KEY = os.environ.get("MASSIVE_SECRET_KEY", "api-key")
+_BASE_URL = os.environ.get("MASSIVE_API_BASE_URL", "https://api.massive.com")
 
 _DEFAULT_TIMEOUT = 30
 
-# NWS BLOCKS requests without a descriptive User-Agent that includes a contact.
-# Put YOUR real email here before running.
-_USER_AGENT = "(databricks-weather-homework, your-email@example.com)"
 
-# NWS works off lat/lon, not city names. For a homework-sized set a small map
-# is enough. (For arbitrary cities, resolve via the free US Census geocoder -
-# https://geocoding.geo.census.gov - but that is optional polish, not required.)
-CITY_COORDS: dict[str, tuple[float, float]] = {
-    "Chicago, IL": (41.8781, -87.6298),
-    "Austin, TX": (30.2672, -97.7431),
-    "Miami, FL": (25.7617, -80.1918),
-    "Seattle, WA": (47.6062, -122.3321),
-    "New Orleans, LA": (29.9511, -90.0715),
-}
+def _get_api_key() -> str:
+    """Fetch and decode the Massive API key from the Databricks secret scope."""
+    secret = _w.secrets.get_secret(scope=_SCOPE, key=_KEY)
+    return base64.b64decode(secret.value).decode("utf-8")
 
 
-def _stable_id(*parts: Any) -> str:
-    """Deterministic dedup key so re-syncing upserts instead of duplicating."""
-    joined = "|".join(str(p) for p in parts)
-    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:40]
+class MassiveClient:
+    """Thin wrapper around the Massive API with auth + retry-friendly session."""
 
-
-class WeatherClient:
-    """Thin wrapper around the NWS API with a shared session + User-Agent."""
-
-    def __init__(self, base_url: str = "https://api.weather.gov", timeout: int = _DEFAULT_TIMEOUT):
-        self.base_url = base_url.rstrip("/")
+    def __init__(self, base_url: str | None = None, timeout: int = _DEFAULT_TIMEOUT):
+        self.base_url = (base_url or _BASE_URL).rstrip("/")
         self.timeout = timeout
         self._session = requests.Session()
         self._session.headers.update(
-            {"User-Agent": _USER_AGENT, "Accept": "application/geo+json"}
+            {
+                "Authorization": f"Bearer {_get_api_key()}",
+                "Content-Type": "application/json",
+            }
         )
 
-    def _get(self, path_or_url: str, params: dict[str, Any] | None = None) -> Any:
-        url = path_or_url if path_or_url.startswith("http") else f"{self.base_url}{path_or_url}"
-        resp = self._session.get(url, params=params, timeout=self.timeout)
+    def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        resp = self._session.get(f"{self.base_url}{path}", params=params, timeout=self.timeout)
         resp.raise_for_status()
         return resp.json()
 
-    # -- raw NWS calls -----------------------------------------------------
+    def post(self, path: str, json: dict[str, Any] | None = None) -> Any:
+        resp = self._session.post(f"{self.base_url}{path}", json=json, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
 
-    def resolve_point(self, location: str) -> dict[str, Any]:
-        """Resolve 'City, ST' (in CITY_COORDS) or a 'lat,lon' string to grid metadata."""
-        if location in CITY_COORDS:
-            lat, lon = CITY_COORDS[location]
-        else:
-            lat, lon = [float(x.strip()) for x in location.split(",")]
-
-        props = self._get(f"/points/{lat},{lon}")["properties"]
-        rel = props["relativeLocation"]["properties"]
-        return {
-            "location_label": location,
-            "state": rel.get("state"),
-            "forecast_url": props["forecast"],
-        }
-
-    def get_active_alerts(self, state: str) -> list[dict]:
-        """Active alerts for a US state code, e.g. 'IL'. Returns GeoJSON features."""
-        data = self._get("/alerts/active", params={"area": state})
-        return data.get("features", [])
-
-    def get_forecast_periods(self, forecast_url: str) -> list[dict]:
-        """Multi-day forecast periods for a grid point."""
-        return self._get(forecast_url)["properties"]["periods"]
-
-    # -- normalization into weather_documents shape ------------------------
-
-    @staticmethod
-    def normalize_alert(location_label: str, feature: dict) -> dict:
-        p = feature.get("properties", {})
-        narrative = " ".join(x for x in [p.get("description"), p.get("instruction")] if x).strip()
-        return {
-            "id": p.get("id")
-            or feature.get("id")
-            or _stable_id(location_label, "alert", p.get("event"), p.get("effective")),
-            "location": location_label,
-            "source_type": "alert",
-            "headline": p.get("event") or p.get("headline"),
-            "narrative_text": narrative,
-            "issued_at": p.get("effective") or p.get("onset"),
-            "payload": feature,
-        }
-
-    @staticmethod
-    def normalize_forecast(location_label: str, period: dict) -> dict:
-        return {
-            "id": _stable_id(location_label, "forecast", period.get("number"), period.get("startTime")),
-            "location": location_label,
-            "source_type": "forecast",
-            "headline": period.get("name"),
-            "narrative_text": (period.get("detailedForecast") or "").strip(),
-            "issued_at": period.get("startTime"),
-            "payload": period,
-        }
-
-    def harvest(self, locations: list[str], limit: int = 50) -> list[dict]:
-        """Fetch + normalize alerts and forecast periods for each location.
-
-        Returns a list of normalized document dicts (capped at `limit`).
-        Locations that fail to resolve are skipped, not fatal.
+    def paginated_get(self, path: str, params: dict[str, Any] | None = None, page_size: int = 200):
         """
-        docs: list[dict] = []
-        for loc in locations:
-            try:
-                point = self.resolve_point(loc)
-            except Exception as exc:  # noqa: BLE001 - skip a bad location, keep going
-                print(f"skip {loc!r}: {exc}")
-                continue
+        Generator that yields items across all pages of a "massive" (large)
+        paginated dataset. Assumes a cursor-based API shape:
+        {"items": [...], "next_cursor": "..." | null}
+        Adjust to match the real Massive API pagination contract.
+        """
+        cursor = None
+        params = dict(params or {})
+        params["page_size"] = page_size
 
-            if point.get("state"):
-                for feature in self.get_active_alerts(point["state"]):
-                    doc = self.normalize_alert(loc, feature)
-                    if doc["narrative_text"]:
-                        docs.append(doc)
+        while True:
+            if cursor:
+                params["cursor"] = cursor
+            data = self.get(path, params=params)
+            items = data.get("items", [])
+            for item in items:
+                yield item
 
-            try:
-                for period in self.get_forecast_periods(point["forecast_url"]):
-                    doc = self.normalize_forecast(loc, period)
-                    if doc["narrative_text"]:
-                        docs.append(doc)
-            except Exception as exc:  # noqa: BLE001
-                print(f"forecast failed for {loc!r}: {exc}")
-
-            if len(docs) >= limit:
+            cursor = data.get("next_cursor")
+            if not cursor:
                 break
 
-        return docs[:limit]
+    def get_latest_price(self, symbol: str) -> dict:
+        """
+        Fetch the latest traded price for a single symbol in a SINGLE API
+        call (no pagination). Use this instead of paginated_get() whenever
+        the caller needs to stay within tight API rate limits (e.g.
+        classroom/student accounts), at the cost of only being able to
+        request one symbol per request.
+        """
+        data = self.get(f"/v2/aggs/ticker/{symbol}/prev")
+        return data
+
+    def get_news(
+        self,
+        ticker: str,
+        limit: int = 50,
+        published_utc_gte: str | None = None,
+    ) -> list[dict]:
+        """
+        Fetch recent news articles for a single ticker in a SINGLE API call
+        (GET /v2/reference/news). Returns just the "results" list - each
+        item has: id, title, description, author, article_url, publisher,
+        tickers, keywords, insights (sentiment), published_utc.
+
+        published_utc_gte: optional ISO date/datetime string to only fetch
+        articles published on/after this date (maps to the API's
+        "published_utc.gte" filter).
+        """
+        params: dict[str, Any] = {
+            "ticker": ticker,
+            "limit": limit,
+            "order": "desc",
+            "sort": "published_utc",
+        }
+        if published_utc_gte:
+            params["published_utc.gte"] = published_utc_gte
+
+        data = self.get("/v2/reference/news", params=params)
+        return data.get("results", [])
